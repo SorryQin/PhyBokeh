@@ -1,2 +1,2 @@
 # PhyBokeh
-Though I'm a failure, I won't forgive.
+Though I'm a failure, I won't forgive it.
