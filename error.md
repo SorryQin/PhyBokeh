@@ -34,3 +34,19 @@ cross_attention_kwargs ['pisa_strength'] are not expected by AttnProcessorDistRe
 cross_attention_kwargs ['pisa_strength'] are not expected by AttnProcessorDistReciprocal and will be ignored.
 cross_attention_kwargs ['pisa_strength'] are not expected by AttnProcessorDistReciprocal and will be ignored.
 cross_attention_kwargs ['pisa_strength'] are not expected by AttnProcessorDistReciprocal and will be ignored.
+
+## 3
+3t（例如 t = 499,300,100）
+--pisa_ratio_start 1.0
+--pisa_ratio_end 0.3
+--step_k_start 1.0
+--step_k_end 0.6
+直觉上大致会是：
+
+前步：PISA 强、改动大
+后步：PISA 仍有 30%，但更新幅度收敛到 60%
+5t（例如 499,400,300,200,100）
+--pisa_ratio_start 1.0
+--pisa_ratio_end 0.2
+--step_k_start 1.0
+--step_k_end 0.4
