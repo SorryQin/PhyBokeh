@@ -145,6 +145,42 @@ def compute_pisa_strength_denoise_step(
     )
     return float(start_ratio + (end_ratio - start_ratio) * progress)
 
+
+def parse_step_update_scales(raw_scales: str):
+    if raw_scales is None:
+        return None
+    raw_scales = raw_scales.strip()
+    if raw_scales == "":
+        return None
+    try:
+        values = [float(v.strip()) for v in raw_scales.split(",") if v.strip() != ""]
+    except ValueError as exc:
+        raise ValueError("--step_update_scales must be a comma-separated float list.") from exc
+    if len(values) == 0:
+        return None
+    for v in values:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("--step_update_scales values must be in [0, 1].")
+    return values
+
+
+def compute_step_update_scale(
+    sub_step_index: int,
+    num_denoise_steps: int,
+    explicit_scales,
+    start_scale: float,
+    end_scale: float,
+) -> float:
+    if explicit_scales is not None:
+        return float(explicit_scales[sub_step_index])
+    if num_denoise_steps <= 1:
+        return float(end_scale)
+    progress = min(
+        max(sub_step_index / float(num_denoise_steps - 1), 0.0),
+        1.0,
+    )
+    return float(start_scale + (end_scale - start_scale) * progress)
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.30.0.dev0")
 
@@ -461,6 +497,27 @@ def parse_args():
         default=0.0,
         help="本脚本：timesteps_list 最后一步的 PISA 比例。",
     )
+    parser.add_argument(
+        "--step_update_scales",
+        type=str,
+        default="",
+        help=(
+            "显式指定每个去噪子步的更新系数 k_i，逗号分隔（例如 1.0,0.8,0.6）。"
+            " 若为空，则使用 step_k_start->step_k_end 线性插值。"
+        ),
+    )
+    parser.add_argument(
+        "--step_k_start",
+        type=float,
+        default=1.0,
+        help="当未显式指定 step_update_scales 时，第一个子步的更新系数。",
+    )
+    parser.add_argument(
+        "--step_k_end",
+        type=float,
+        default=1.0,
+        help="当未显式指定 step_update_scales 时，最后一个子步的更新系数。",
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -470,6 +527,9 @@ def parse_args():
         raise ValueError("You must specify a train data directory.")
     if not (0.0 <= args.pisa_ratio_start <= 1.0 and 0.0 <= args.pisa_ratio_end <= 1.0):
         raise ValueError("--pisa_ratio_start and --pisa_ratio_end must be in [0, 1].")
+    if not (0.0 <= args.step_k_start <= 1.0 and 0.0 <= args.step_k_end <= 1.0):
+        raise ValueError("--step_k_start and --step_k_end must be in [0, 1].")
+    args.step_update_scales = parse_step_update_scales(args.step_update_scales)
 
     return args
 
@@ -626,6 +686,11 @@ def main():
     # timesteps_list = [499, 350, 150]
     save_timesteps = [499, 300, 100]
     SAVE_FREQ = 50
+    if args.step_update_scales is not None and len(args.step_update_scales) != len(timesteps_list):
+        raise ValueError(
+            f"--step_update_scales expects {len(timesteps_list)} values for timesteps_list={timesteps_list}, "
+            f"but got {len(args.step_update_scales)}."
+        )
 
     pipeline = StableDiffusionXLPipeline(
             # args.pretrained_model_name_or_path,
@@ -983,8 +1048,16 @@ def main():
                     alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
                     beta_prod_t = 1 - alpha_prod_t
 
-                    # 单步反推
-                    x = (x - beta_prod_t.sqrt() * model_pred) / alpha_prod_t.sqrt()
+                    # 单步反推 + 显式步间缩放（k_i 控制该子步更新幅度）
+                    x_full = (x - beta_prod_t.sqrt() * model_pred) / alpha_prod_t.sqrt()
+                    step_k = compute_step_update_scale(
+                        sub_step_index=sub_i,
+                        num_denoise_steps=num_denoise,
+                        explicit_scales=args.step_update_scales,
+                        start_scale=args.step_k_start,
+                        end_scale=args.step_k_end,
+                    )
+                    x = x + step_k * (x_full - x)
 
                     # adding
                     if t in save_timesteps:
@@ -1102,7 +1175,8 @@ def main():
                     progress_bar.set_postfix({"loss": f"{loss.item():.4f}", 
                                               "lpips": f"{loss_lpips.item():.3f}" if args.lpips else 0,
                                               "PSNR": f"{-10*torch.log10(loss_mse/4).mean().item():.2f}",
-                                              "pisa": f"{pisa_strength:.2f}"})
+                                              "pisa": f"{pisa_strength:.2f}",
+                                              "k": f"{step_k:.2f}"})
                     buffer['loss']+=loss_mse.detach().mean().item()
                     if args.edge:
                         buffer['lP']+=loss_edge.detach().item()
