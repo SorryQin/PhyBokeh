@@ -46,6 +46,7 @@ class AttnProcessor2_0:
         shape=None, # Placeholder to avoid warnings
         cutoff=None, # Placeholder to avoid warnings
         disp_coc=None, # Placeholder to avoid warnings
+        pisa_strength: Optional[float] = None, # 与 PISA 块一致声明，避免被 diffusers 丢弃，20260427添加，for 3t
         *args,
         **kwargs,
     ) -> torch.Tensor:
