@@ -4,6 +4,7 @@ import sys, os
 sys.path.append(os.path.join(os.path.dirname(__file__), "vision-aided-gan-main"))
 
 import argparse
+import inspect
 import logging
 import math
 import os
@@ -99,6 +100,24 @@ def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
 
     for sub_name, child in module.named_children():
         fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)
+
+
+def build_attn_processor(model_imported, **kwargs):
+    processor_cls = getattr(model_imported, "AttnProcessorDistReciprocal", AttnProcessorDistReciprocal)
+    try:
+        call_sig = inspect.signature(processor_cls.__call__)
+        supports_pisa_strength = "pisa_strength" in call_sig.parameters
+    except Exception:
+        supports_pisa_strength = False
+
+    if not supports_pisa_strength:
+        logger.warning(
+            "Loaded AttnProcessorDistReciprocal does not declare `pisa_strength`; "
+            "falling back to local PISA_attn_processor.AttnProcessorDistReciprocal."
+        )
+        processor_cls = AttnProcessorDistReciprocal
+
+    return processor_cls(**kwargs)
  
 def gamma_correction(image: torch.Tensor, gamma: float = 2.2, eps=1e-7, upper_clip=None):
     if gamma == 1:
@@ -630,7 +649,11 @@ def main():
         dirname = args.output_dir.strip('/').split('/')[-1]
         shutil.copy2(f'{args.attn_file}', f'ckpt/{dirname}_processor.py')
         model_imported = import_module(f'ckpt.{dirname}_processor')
-        fn_recursive_attn_processor('unet', pipeline.unet, getattr(model_imported, 'AttnProcessorDistReciprocal')(supersampling_num=4,segment_num=5))
+        fn_recursive_attn_processor(
+            'unet',
+            pipeline.unet,
+            build_attn_processor(model_imported, supersampling_num=4, segment_num=5),
+        )
         print("SET TO My Processor!") 
 
     # Dataset and DataLoaders creation:
@@ -828,7 +851,11 @@ def main():
                 if not os.path.exists(f'ckpt/{dirname}_processor.py'):
                     shutil.copy2(f'{path}/PISA_attn_processor.py', f'ckpt/{dirname}_processor.py')
                 model_imported = import_module(f'ckpt.{dirname}_processor')
-                fn_recursive_attn_processor('unet', pipeline.unet, getattr(model_imported, 'AttnProcessorDistReciprocal')(hard=global_step*args.train_batch_size))
+                fn_recursive_attn_processor(
+                    'unet',
+                    pipeline.unet,
+                    build_attn_processor(model_imported, hard=global_step * args.train_batch_size),
+                )
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
