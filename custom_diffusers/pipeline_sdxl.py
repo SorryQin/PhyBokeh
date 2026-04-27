@@ -1,4 +1,4 @@
-# Modified by Chengxuan Zhu to support tiled denoise
+# Modified by sorryqin.
 # Copyright 2024 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1250,11 +1250,13 @@ class TiledStableDiffusionXLPipeline(
                     gaus_accu = torch.zeros_like(latent_model_input)
                     for ind, (ch, cw, disp_coc_local) in enumerate(zip(cropped_height_coord, cropped_width_coord, disp_coc_locals)):
                         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids[ind]}
+                        _cak = dict(self.cross_attention_kwargs) if self.cross_attention_kwargs else {}
+                        _cak["disp_coc"] = disp_coc_local
                         buffer_noise_pred[...,ch:ch+TILE_SIZE, cw:cw+TILE_SIZE] += self.unet(
                             sample=latent_model_input[...,ch:ch+TILE_SIZE, cw:cw+TILE_SIZE],
                             timestep=t,
                             encoder_hidden_states=prompt_embeds,
-                            cross_attention_kwargs={'disp_coc': disp_coc_local},
+                            cross_attention_kwargs=_cak,
                             added_cond_kwargs=added_cond_kwargs,
                             return_dict=False,
                         )[0] * buffer_noise_kernel
