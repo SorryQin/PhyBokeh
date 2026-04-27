@@ -2,7 +2,7 @@ import argparse
 import logging
 import math
 import os
-from typing import Optional
+from typing import Optional, Tuple
 # os.environ['HF_ENDPOINT'] = 'http://hf-mirror.com'
 import random
 import pandas as pd
@@ -48,6 +48,22 @@ from diffusers.utils.import_utils import is_xformers_available
 from classical_renderer.scatter import ModuleRenderScatter  # circular aperture
 # from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
 
+# 与 train_pisa_per_step.py 对齐：同一前向内每个 denoise 子步单独计算 pisa_strength
+def compute_pisa_strength_denoise_step(
+    sub_step_index: int,
+    num_denoise_steps: int,
+    start_ratio: float,
+    end_ratio: float,
+) -> float:
+    if num_denoise_steps <= 1:
+        return float(end_ratio)
+    progress = min(
+        max(sub_step_index / float(num_denoise_steps - 1), 0.0),
+        1.0,
+    )
+    return float(start_ratio + (end_ratio - start_ratio) * progress)
+
+
 # 与 train.py 中 gamma_correction 一致，保证 VAE 输入域与训练对齐
 def gamma_correction(image: torch.Tensor, gamma: float = 2.2, eps=1e-7, upper_clip=None):
     if gamma == 1:
@@ -61,8 +77,7 @@ def swap_words(s: str, x: str, y: str):
     return s.replace(x, chr(0)).replace(y, x).replace(chr(0), y)
 
 
-def _decode_latents_to_pil(pipeline, latents: torch.Tensor, resize_to):
-    """Decode SDXL latents to PIL Image; optional (width, height) resize (e.g. to match original resolution)."""
+def _decode_latents_to_pil(pipeline, latents: torch.Tensor, resize_to: Optional[Tuple[int, int]]) -> Image.Image:
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False,
@@ -77,6 +92,13 @@ def _decode_latents_to_pil(pipeline, latents: torch.Tensor, resize_to):
         rw, rh = resize_to
         pil = pil.resize((int(rw), int(rh)), resample=Image.Resampling.LANCZOS)
     return pil
+
+
+def _save_pil_path(path: str, pil_img: Image.Image, ext: str) -> None:
+    if ext.lower() in ("jpg", "jpeg"):
+        pil_img.save(path, quality=95, subsampling=0)
+    else:
+        pil_img.save(path)
 
 
 logger = get_logger(__name__)
@@ -95,18 +117,23 @@ def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
 import time
 
 @torch.inference_mode()
-def log_validation(pipeline, vae,
-                   seed, train_T_list,
-                   accelerator,
-                   validation_prompt="an excellent photo with a large aperture",
-                   aif_image=None, disp_coc=None,
-                   gamma: float = 1.0,
-                   pisa_strength: float = 0.0,
-                   step_save_dir: Optional[str] = None,
-                   resize_to=None,
-                   save_initial_encode: bool = False,
-                   step_image_ext: str = "png"):
-    """若提供 step_save_dir，则在每个 train_T_list 步之后将当前 latents 解码并保存为图片。"""
+def log_validation(
+    pipeline,
+    vae,
+    seed,
+    train_T_list,
+    accelerator,
+    validation_prompt="an excellent photo with a large aperture",
+    aif_image=None,
+    disp_coc=None,
+    gamma: float = 1.0,
+    pisa_ratio_start: float = 1.0,
+    pisa_ratio_end: float = 0.0,
+    step_save_dir: Optional[str] = None,
+    resize_to: Optional[Tuple[int, int]] = None,
+    save_initial_encode: bool = False,
+    step_image_ext: str = "png",
+):
     device = accelerator.device
 
     dtype = pipeline.unet.dtype  # FP16 或 FP32
@@ -141,24 +168,30 @@ def log_validation(pipeline, vae,
 
     # --- 确保 scheduler 所有 tensor 在 GPU 上 ---
     scheduler = pipeline.scheduler
+    # 2026.3.5 解决NaN爆炸的问题，注释下面两行的格式转换
     scheduler.set_timesteps(1000, device=device) # adding
     scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=dtype)
     scheduler.betas = scheduler.betas.to(device=device, dtype=dtype)
-
-    def _save_pil(path: str, pil_img: Image.Image) -> None:
-        if step_image_ext.lower() in ("jpg", "jpeg"):
-            pil_img.save(path, quality=95, subsampling=0)
-        else:
-            pil_img.save(path)
 
     if step_save_dir is not None:
         os.makedirs(step_save_dir, exist_ok=True)
         if save_initial_encode:
             pil0 = _decode_latents_to_pil(pipeline, latents, resize_to)
-            _save_pil(os.path.join(step_save_dir, f"step000_init_encode.{step_image_ext}"), pil0)
+            _save_pil_path(
+                os.path.join(step_save_dir, f"step000_init_encode.{step_image_ext}"),
+                pil0,
+                step_image_ext,
+            )
 
-    # --- 迭代 denoise ---
-    for step_i, t in enumerate(train_T_list):
+    # --- 迭代 denoise（每步重新计算 pisa_strength，可选保存该步后的解码图）---
+    n_steps = len(train_T_list)
+    for sub_i, t in enumerate(train_T_list):
+        pisa_strength = compute_pisa_strength_denoise_step(
+            sub_step_index=sub_i,
+            num_denoise_steps=n_steps,
+            start_ratio=pisa_ratio_start,
+            end_ratio=pisa_ratio_end,
+        )
         t_tensor = torch.tensor([t], dtype=torch.long, device=device)
 
         noise_pred = pipeline.unet(
@@ -181,12 +214,13 @@ def log_validation(pipeline, vae,
 
         if step_save_dir is not None:
             pil = _decode_latents_to_pil(pipeline, latents, resize_to)
-            name = f"step{step_i + 1:03d}_t{t:04d}.{step_image_ext}"
-            out_p = os.path.join(step_save_dir, name)
-            _save_pil(out_p, pil)
+            name = f"step{sub_i + 1:03d}_t{t:04d}_pisa{float(pisa_strength):.2f}.{step_image_ext}"
+            _save_pil_path(os.path.join(step_save_dir, name), pil, step_image_ext)
             print(f"saved {name}")
 
-    # --- 解码输出（与逐步保存中最后一步一致）---
+
+
+    # --- 解码输出 ---
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False
@@ -198,7 +232,7 @@ def log_validation(pipeline, vae,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Inference with per-timestep images saved (same settings as inference.py).",
+        description="Inference (PISA 权重在 train_T_list 各子步上线性变化，对齐 train_pisa_per_step.py)。",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -286,19 +320,16 @@ def parse_args():
         help="VAE 编码前 gamma，与 train.py --gamma 一致（默认 1 即不变换）。",
     )
     parser.add_argument(
-        "--pisa_strength",
+        "--pisa_ratio_start",
         type=float,
-        default=None,
-        help=(
-            "PISA 与标准注意力的混合系数，与训练末段一致时通常取 --pisa_ratio_end（默认 0）。"
-            "若为 None，则使用 --pisa_ratio_end。"
-        ),
+        default=1.0,
+        help="与 train_pisa_per_step 一致：train_T_list 第一步的 PISA 比例。",
     )
     parser.add_argument(
         "--pisa_ratio_end",
         type=float,
         default=0.0,
-        help="当未指定 --pisa_strength 时作为推理时的 pisa_strength（应对齐 train 的 --pisa_ratio_end）。",
+        help="与 train_pisa_per_step 一致：train_T_list 最后一步的 PISA 比例。",
     )
     parser.add_argument(
         "--supersampling_num",
@@ -318,16 +349,21 @@ def parse_args():
         help="若 batch 含 K 且与训练时一致（如 defocus*K，K 已为 K_strength/10），用其构造 disp_coc 第二通道；默认用 --K 与 train 中手动尺度。",
     )
     parser.add_argument(
+        "--no_save_intermediate",
+        action="store_true",
+        help="默认将每个去噪子步后的 latents 解码并保存到子目录；加此标志则只保存最终 jpg。",
+    )
+    parser.add_argument(
         "--save_initial_encode",
         action="store_true",
-        help="在 step_save_dir 中额外保存 VAE 编码后、去噪前的解码预览 step000_init_encode.*。",
+        help="保存 VAE 编码后、去噪前的图 step000_init_encode.*（需未加 --no_save_intermediate）。",
     )
     parser.add_argument(
         "--step_image_ext",
         type=str,
         default="png",
         choices=["png", "jpg"],
-        help="每步保存的图像格式。",
+        help="中间步保存格式。",
     )
     
     parser.add_argument(
@@ -335,8 +371,8 @@ def parse_args():
     )
 
     args = parser.parse_args()
-    if args.pisa_strength is None:
-        args.pisa_strength = args.pisa_ratio_end
+    if not (0.0 <= args.pisa_ratio_start <= 1.0 and 0.0 <= args.pisa_ratio_end <= 1.0):
+        raise ValueError("--pisa_ratio_start and --pisa_ratio_end must be in [0, 1].")
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -519,12 +555,14 @@ def main():
                 coc2 = defocus_strength * amplify
             h, w = coc2.shape[-2:]
             new_w, new_h = int(w / args.upsample), int(h / args.upsample)
-            step_dir = os.path.join(
-                output_dir,
-                f"{batch['filename'][0]}_blur{blur_strength:.2f}_timesteps",
-            )
+            step_dir = None
+            if not args.no_save_intermediate:
+                step_dir = os.path.join(
+                    output_dir,
+                    f"{batch['filename'][0]}_blur{blur_strength:.2f}_pisa_step_frames",
+                )
 
-            # 推理（pisa_strength 对齐训练末期 pisa_ratio_end，默认 0）；每步结果写入 step_dir
+            # 推理（子步 pisa 与 train_pisa_per_step 一致；默认每步保存解码图到 step_dir）
             image_tensor, duration = log_validation(
                 pipeline,
                 pipeline.vae,
@@ -535,9 +573,10 @@ def main():
                 aif_image=batch['pixel_values'],
                 disp_coc=torch.cat([disparity, coc2], 1).to(weight_dtype),
                 gamma=args.gamma,
-                pisa_strength=args.pisa_strength,
+                pisa_ratio_start=args.pisa_ratio_start,
+                pisa_ratio_end=args.pisa_ratio_end,
                 step_save_dir=step_dir,
-                resize_to=(new_w, new_h),
+                resize_to=(new_w, new_h) if step_dir is not None else None,
                 save_initial_encode=args.save_initial_encode,
                 step_image_ext=args.step_image_ext,
             )
@@ -553,7 +592,7 @@ def main():
             image_np = image_tensor.permute(1, 2, 0).cpu().numpy()
             image = Image.fromarray(image_np)
 
-            # resize 并保存（与分步图同一输出尺寸）
+            # resize 并保存（new_w/new_h 已在上面与中间步图对齐）
             image = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
             out_path = f"{output_dir}/{batch['filename'][0]}_blur{blur_strength:.2f}.jpg"
             image.save(out_path, subsampling=0, quality=100)
