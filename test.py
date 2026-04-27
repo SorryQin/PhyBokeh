@@ -110,6 +110,13 @@ def gamma_correction(image: torch.Tensor, gamma: float = 2.2, eps=1e-7, upper_cl
     return image_norm*span + base # denormalize to [base, base+span]
     return 2*(torch.clamp(image*.5+.5,eps,upper_clip).pow(gamma)) - 1
 
+def compute_pisa_strength(global_step: int, max_steps: int, start_ratio: float, end_ratio: float) -> float:
+    """Linearly decay PISA guidance from start_ratio to end_ratio over training."""
+    if max_steps <= 1:
+        return float(end_ratio)
+    progress = min(max(global_step / float(max_steps - 1), 0.0), 1.0)
+    return float(start_ratio + (end_ratio - start_ratio) * progress)
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # check_min_version("0.30.0.dev0")
 
@@ -414,6 +421,18 @@ def parse_args():
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument("--set_grads_to_none", action="store_true", help="Whether or not to set gradients to None.")
+    parser.add_argument(
+        "--pisa_ratio_start",
+        type=float,
+        default=1.0,
+        help="PISA attention mix ratio at training start (1.0 means pure PISA).",
+    )
+    parser.add_argument(
+        "--pisa_ratio_end",
+        type=float,
+        default=0.0,
+        help="PISA attention mix ratio at training end (0.0 means pure SDXL attention).",
+    )
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -421,6 +440,8 @@ def parse_args():
 
     if args.train_data_dir is None:
         raise ValueError("You must specify a train data directory.")
+    if not (0.0 <= args.pisa_ratio_start <= 1.0 and 0.0 <= args.pisa_ratio_end <= 1.0):
+        raise ValueError("--pisa_ratio_start and --pisa_ratio_end must be in [0, 1].")
 
     return args
 
@@ -899,6 +920,12 @@ def main():
                 # adding
                 intermediate_images = {}
 
+                pisa_strength = compute_pisa_strength(
+                    global_step=global_step,
+                    max_steps=args.max_train_steps,
+                    start_ratio=args.pisa_ratio_start,
+                    end_ratio=args.pisa_ratio_end,
+                )
                 for t in timesteps_list:
                     bsz = x.shape[0]
                     timesteps = torch.full(
@@ -908,25 +935,12 @@ def main():
                         dtype=torch.long
                     )
 
-                    # adding
-                    set_pisa_context(pipeline.unet, disp_coc, timesteps)
-
-                    # model_pred = pipeline.unet(
-                    #     x,
-                    #     timesteps,
-                    #     encoder_hidden_states.to(torch.float32),
-                    #     added_cond_kwargs=added_cond_kwargs,
-                    #     cross_attention_kwargs={
-                    #         'disp_coc': disp_coc,
-                    #         'timestep': timesteps,
-                    #     },
-                    # ).sample
-
                     model_pred = pipeline.unet(
                         x,
                         timesteps,
                         encoder_hidden_states.to(torch.float32),
                         added_cond_kwargs=added_cond_kwargs,
+                        cross_attention_kwargs={'disp_coc': disp_coc, 'pisa_strength': pisa_strength},
                     ).sample
 
                     alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
@@ -1050,7 +1064,8 @@ def main():
                 if accelerator.is_main_process:
                     progress_bar.set_postfix({"loss": f"{loss.item():.4f}", 
                                               "lpips": f"{loss_lpips.item():.3f}" if args.lpips else 0,
-                                              "PSNR": f"{-10*torch.log10(loss_mse/4).mean().item():.2f}"})
+                                              "PSNR": f"{-10*torch.log10(loss_mse/4).mean().item():.2f}",
+                                              "pisa": f"{pisa_strength:.2f}"})
                     buffer['loss']+=loss_mse.detach().mean().item()
                     if args.edge:
                         buffer['lP']+=loss_edge.detach().item()
