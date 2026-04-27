@@ -47,6 +47,15 @@ from diffusers.utils.import_utils import is_xformers_available
 from classical_renderer.scatter import ModuleRenderScatter  # circular aperture
 # from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
 
+# 与 train.py 中 gamma_correction 一致，保证 VAE 输入域与训练对齐
+def gamma_correction(image: torch.Tensor, gamma: float = 2.2, eps=1e-7, upper_clip=None):
+    if gamma == 1:
+        return image
+    base = image.min().detach()
+    span = (image.max() - base).detach()
+    image_norm = torch.clamp((image - base) / span, eps, upper_clip).pow(gamma)
+    return image_norm * span + base
+
 def swap_words(s: str, x: str, y: str):
     return s.replace(x, chr(0)).replace(y, x).replace(chr(0), y)
 
@@ -71,13 +80,15 @@ def log_validation(pipeline, vae,
                    seed, train_T_list,
                    accelerator,
                    validation_prompt="an excellent photo with a large aperture",
-                   aif_image=None, disp_coc=None):
+                   aif_image=None, disp_coc=None,
+                   gamma: float = 1.0,
+                   pisa_strength: float = 0.0):
     device = accelerator.device
 
     dtype = pipeline.unet.dtype  # FP16 或 FP32
 
-    # --- 准备输入 ---
-    aif_image = aif_image.to(device=device, dtype=dtype)
+    # --- 准备输入（与 train：gamma_correction 后 VAE encode）---
+    aif_image = gamma_correction(aif_image.to(device=device, dtype=torch.float32), gamma).to(dtype=dtype)
     latents = vae.encode(aif_image).latent_dist.mode()
     latents = latents * pipeline.vae.config.scaling_factor
     latents = latents.to(device=device, dtype=dtype)
@@ -124,7 +135,7 @@ def log_validation(pipeline, vae,
                 "text_embeds": pooled,
                 "time_ids": time_ids,
             },
-            cross_attention_kwargs={"disp_coc": disp_coc},
+            cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
         latents = scheduler.step(
@@ -154,94 +165,6 @@ def log_validation(pipeline, vae,
 
     return (image, None)
 
-
-# @torch.inference_mode()
-# def log_validation(pipeline, vae,
-#     seed, train_T_list,
-#     accelerator,
-#     validation_prompt="an excellent photo with a large aperture",
-#     aif_image=None,disp_coc=None
-# ):
-#     device = accelerator.device
-
-#     vae_dtype = vae.dtype  # 一般是 torch.float16
-#     aif_image = aif_image.to(device=vae.device, dtype=vae_dtype)
-#     latents = vae.encode(aif_image).latent_dist.mode()
-
-#     # latents = pipeline.vae.encode(aif_image).latent_dist.mode()
-#     latents = latents * pipeline.vae.config.scaling_factor
-#     latents = latents.to(device)
-
-#     prompt_embeds, _, pooled_prompt_embeds, _ = pipeline.encode_prompt(
-#         prompt=validation_prompt,
-#         device=device,
-#         num_images_per_prompt=1,
-#         do_classifier_free_guidance=False,
-#     )
-
-#     pooled = pooled_prompt_embeds
-
-#     # === 构造 SDXL time_ids ===
-#     _, _, h, w = latents.shape
-#     height = h * 8
-#     width = w * 8
-
-#     time_ids = torch.tensor(
-#         [[height, width, 0, 0, height, width]],
-#         device=latents.device,
-#         dtype=pooled.dtype,
-#     )
-
-#     time_ids = time_ids.repeat(latents.shape[0], 1)
-#     pooled = pooled.to(device=device)
-#     disp_coc = disp_coc.to(device=device)
-#     time_ids = time_ids.to(device=device)
-
-#     # 先确定 dtype
-#     dtype = pipeline.unet.dtype  # FP16 或 FP32
-#     # prompt_embeds / pooled
-#     prompt_embeds = prompt_embeds.to(dtype)
-#     pooled = pooled.to(dtype)
-#     time_ids = time_ids.to(dtype)
-#     # disp_coc
-#     disp_coc = disp_coc.to(dtype)
-
-#     for t in train_T_list:
-#         t_cpu = torch.tensor([t], dtype=torch.long, device='cpu')  # scheduler 索引需要 CPU
-#         t_gpu = t_cpu.to(latents.device)
-#         # t = torch.tensor([t], dtype=torch.long, device=device)
-
-#         noise_pred = pipeline.unet(
-#             latents,
-#             t_gpu,
-#             encoder_hidden_states=prompt_embeds,
-#             added_cond_kwargs={
-#                 "text_embeds": pooled,
-#                 "time_ids": time_ids,
-#             },
-#             cross_attention_kwargs={"disp_coc": disp_coc},
-#         ).sample
-
-#         pipeline.scheduler.alphas_cumprod = pipeline.scheduler.alphas_cumprod.to(latents.device)
-#         pipeline.scheduler.betas = pipeline.scheduler.betas.to(latents.device)
-#         # pipeline.scheduler.alphas_cumprod_prev = pipeline.scheduler.alphas_cumprod_prev.to(latents.device)
-#         # pipeline.scheduler.sqrt_one_minus_alphas_cumprod = pipeline.scheduler.sqrt_one_minus_alphas_cumprod.to(latents.device)
-#         # pipeline.scheduler.sqrt_recip_alphas_cumprod = pipeline.scheduler.sqrt_recip_alphas_cumprod.to(latents.device)
-#         # pipeline.scheduler.sqrt_recipm1_alphas_cumprod = pipeline.scheduler.sqrt_recipm1_alphas_cumprod.to(latents.device)
-
-#         latents = pipeline.scheduler.step(
-#             noise_pred,
-#             t_cpu,
-#             latents,
-#             return_dict=True,
-#         ).prev_sample
-
-#     image = pipeline.vae.decode(
-#         latents / pipeline.vae.config.scaling_factor,
-#         return_dict=False
-#     )[0]
-
-#     return (image,None)
 
 
 def parse_args():
@@ -320,11 +243,48 @@ def parse_args():
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./output/run1/checkpoint-40000",
+        default="./output/run6/checkpoint-70000",
         help=(
-            "Whether training should be resumed from a previous checkpoint. Use a path saved by"
-            ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
+            "Directory containing pytorch_lora_weights.safetensors and vae.ckpt (same layout as train checkpoints)."
         ),
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=1.0,
+        help="VAE 编码前 gamma，与 train.py --gamma 一致（默认 1 即不变换）。",
+    )
+    parser.add_argument(
+        "--pisa_strength",
+        type=float,
+        default=None,
+        help=(
+            "PISA 与标准注意力的混合系数，与训练末段一致时通常取 --pisa_ratio_end（默认 0）。"
+            "若为 None，则使用 --pisa_ratio_end。"
+        ),
+    )
+    parser.add_argument(
+        "--pisa_ratio_end",
+        type=float,
+        default=0.0,
+        help="当未指定 --pisa_strength 时作为推理时的 pisa_strength（应对齐 train 的 --pisa_ratio_end）。",
+    )
+    parser.add_argument(
+        "--supersampling_num",
+        type=int,
+        default=4,
+        help="与训练 AttnProcessorDistReciprocal 一致（train 默认 4）。",
+    )
+    parser.add_argument(
+        "--segment_num",
+        type=int,
+        default=5,
+        help="与训练 AttnProcessorDistReciprocal 一致（train 默认 5）。",
+    )
+    parser.add_argument(
+        "--use_dataset_k",
+        action="store_true",
+        help="若 batch 含 K 且与训练时一致（如 defocus*K，K 已为 K_strength/10），用其构造 disp_coc 第二通道；默认用 --K 与 train 中手动尺度。",
     )
     
     parser.add_argument(
@@ -332,6 +292,8 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    if args.pisa_strength is None:
+        args.pisa_strength = args.pisa_ratio_end
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -356,7 +318,7 @@ def main():
     # 初始化 Accelerator
     # 显式指定 cpu=False 和 mixed_precision，不依赖自动配置
     accelerator = Accelerator(
-        mixed_precision="no", #2026.3.5： fp16 改成了 no 
+        mixed_precision=args.mixed_precision,
         cpu=False
     )
     
@@ -459,26 +421,19 @@ def main():
         val_dataset, batch_size=1, shuffle=False, num_workers=1, pin_memory=True, persistent_workers=True
     )
 
-    if args.resume_from_checkpoint:
-        if not os.path.isdir(args.resume_from_checkpoint):
-            raise NotImplementedError("The specified checkpoint should be a directory!")
-        path = args.resume_from_checkpoint
-        accelerator.print(f"Resuming from checkpoint {path}")
-        pipeline.load_lora_weights(path, 
-                    weight_name="pytorch_lora_weights.safetensors")
-        pipeline.vae.load_state_dict(
-            torch.load(os.path.join(path, "vae.ckpt"), weights_only=True),
-            strict=False)
-    else:
-        pipeline.load_lora_weights(
-            "./output/run1/checkpoint-40000",
-            weight_name="pytorch_lora_weights.safetensors"
+    ckpt_dir = args.resume_from_checkpoint
+    if not ckpt_dir or not os.path.isdir(ckpt_dir):
+        raise ValueError(
+            f"--resume_from_checkpoint must be an existing directory with LoRA+VAE weights, got: {ckpt_dir!r}"
         )
-
-        pipeline.vae.load_state_dict(
-            torch.load("./output/run1/checkpoint-40000/vae.ckpt", map_location="cpu"),
-            strict=False
-        )
+    accelerator.print(f"Loading weights from {ckpt_dir}")
+    pipeline.load_lora_weights(ckpt_dir, weight_name="pytorch_lora_weights.safetensors")
+    vae_path = os.path.join(ckpt_dir, "vae.ckpt")
+    try:
+        vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        vae_sd = torch.load(vae_path, map_location="cpu")
+    pipeline.vae.load_state_dict(vae_sd, strict=False)
 
 
     # pipeline.text_encoder, pipeline.text_encoder_2, pipeline.vae, pipeline.unet = accelerator.prepare(pipeline.text_encoder, pipeline.text_encoder_2, pipeline.vae, pipeline.unet)
@@ -487,7 +442,16 @@ def main():
     pipeline = pipeline.to(accelerator.device)
 
 
-    fn_recursive_attn_processor('unet', pipeline.unet, AttnProcessorDistReciprocal(hard=1e7,supersampling_num=5,segment_num=7,train=False))
+    fn_recursive_attn_processor(
+        "unet",
+        pipeline.unet,
+        AttnProcessorDistReciprocal(
+            hard=1e7,
+            supersampling_num=args.supersampling_num,
+            segment_num=args.segment_num,
+            train=False,
+        ),
+    )
     output_dir = os.path.join(args.output_dir, args.data_id)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -499,13 +463,20 @@ def main():
         blur_strength_list = [0.2, 0.4, 0.6, 0.8, 1.0]
 
         for blur_strength in blur_strength_list:
-            defocus_strength = batch['defocus_strength'] * blur_strength
-            defocus_st_abs = torch.abs(defocus_strength).to(weight_dtype)
-            disparity = batch['disparity']
-            amplify = args.K * args.upsample / 10
-            h, w = defocus_st_abs.shape[-2:]
+            defocus_strength = batch["defocus_strength"] * blur_strength
+            disparity = batch["disparity"]
+            # 与 train.py：disp_coc = cat(disparity, defocus_strength * K)；默认与旧 infer 一致：coc2 = defocus * (K_cli*upsample/10)
+            if args.use_dataset_k and "K" in batch and batch["K"] is not None:
+                k = batch["K"].to(device=accelerator.device, dtype=torch.float32)
+                while k.dim() < 4:
+                    k = k.unsqueeze(-1)
+                coc2 = defocus_strength * k
+            else:
+                amplify = args.K * args.upsample / 10.0
+                coc2 = defocus_strength * amplify
+            h, w = coc2.shape[-2:]
 
-            # 推理
+            # 推理（pisa_strength 对齐训练末期 pisa_ratio_end，默认 0）
             image_tensor, duration = log_validation(
                 pipeline,
                 pipeline.vae,
@@ -514,7 +485,9 @@ def main():
                 accelerator,
                 validation_prompt=batch['texts'],
                 aif_image=batch['pixel_values'],
-                disp_coc=torch.cat([disparity, defocus_st_abs * amplify], 1).to(weight_dtype),
+                disp_coc=torch.cat([disparity, coc2], 1).to(weight_dtype),
+                gamma=args.gamma,
+                pisa_strength=args.pisa_strength,
             )
 
             # --- tensor -> PIL.Image ---
@@ -578,7 +551,8 @@ def main():
     #         image.save(out_path, subsampling=0, quality=100)
 
 
-    print(f"Average duration: {np.mean(durations):.4f} seconds")
+    if durations:
+        print(f"Average duration: {np.mean(durations):.4f} seconds")
 
 
 if __name__ == "__main__":
