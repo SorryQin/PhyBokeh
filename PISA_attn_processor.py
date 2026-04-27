@@ -26,7 +26,7 @@ else:
 
 def customized_scaled_dot_product_attention(query, key, value, weight_matrix=None, disp_coc=None,
                     attn_mask=None, dropout_p=0.0, is_causal=False, scale=None,
-                    hard=1.0, train=True, occ_map=None) -> torch.Tensor:
+                    hard=1.0, train=True, occ_map=None, pisa_strength: float = 1.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     
     scale_factor = 1 / math.sqrt(value.size(-1)) if scale is None else scale
@@ -54,10 +54,20 @@ def customized_scaled_dot_product_attention(query, key, value, weight_matrix=Non
         attn_weight_qk += attn_bias.to(value.device)
         mask = (occ_map).repeat(1,attn_weight_qk.shape[1],1,1)
         attn_weight_qk_max = torch.max(attn_weight_qk, dim=-2, keepdim=True)[0] # To avoid underflow
-        attn_weight_qk = torch.exp(attn_weight_qk-attn_weight_qk_max)
-        attn_weight = attn_weight_qk*attn_weight_manual
-        attn_weight = attn_weight/((torch.sum(attn_weight, dim=-2, keepdim=True)))
-        attn_weight_drop = torch.dropout(attn_weight* (1-mask), dropout_p, train=True)
+        exp_qk = torch.exp(attn_weight_qk - attn_weight_qk_max)
+        attn_pisa = exp_qk * attn_weight_manual
+        attn_pisa = attn_pisa / (torch.sum(attn_pisa, dim=-2, keepdim=True) + 1e-8)
+
+        s = float(pisa_strength)
+        if s >= 1.0 - 1e-6:
+            attn_weight = attn_pisa
+        elif s <= 1e-6:
+            attn_weight = torch.softmax(attn_weight_qk, dim=-1)
+        else:
+            attn_vanilla = torch.softmax(attn_weight_qk, dim=-1)
+            attn_weight = s * attn_pisa + (1.0 - s) * attn_vanilla
+            attn_weight = attn_weight / (attn_weight.sum(dim=-1, keepdim=True) + 1e-8)
+        attn_weight_drop = torch.dropout(attn_weight * (1.0 - mask), dropout_p, train=train)
         return attn_weight_drop.to(value.dtype) @ value
         
 class AttnProcessorDistReciprocal:
@@ -92,6 +102,7 @@ class AttnProcessorDistReciprocal:
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        pisa_strength = float(kwargs.get("pisa_strength", 1.0))
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored. Please remove it, as passing it will raise an error in the future. `scale` should directly be passed while calling the underlying pipeline component i.e., via `cross_attention_kwargs`."
             deprecate("scale", "1.0.0", deprecation_message)
@@ -196,7 +207,7 @@ class AttnProcessorDistReciprocal:
             hidden_states = customized_scaled_dot_product_attention(
                 query, key, value, reci_dist_matrix.to(query.device,dtype=query.dtype), disp_coc,
                 attn_mask=attention_mask, dropout_p=0.1, is_causal=False, hard=math.log(self.hard), 
-                occ_map=occ_map, train=self.train,
+                occ_map=occ_map, train=self.train, pisa_strength=pisa_strength,
             )
             if self.hard < 1e6:
                 self.hard += 1 # harder
