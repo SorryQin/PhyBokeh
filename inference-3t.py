@@ -113,16 +113,21 @@ def swap_words(s: str, x: str, y: str):
     return s.replace(x, chr(0)).replace(y, x).replace(chr(0), y)
 
 
+def _vae_output_to_uint8(image: torch.Tensor) -> np.ndarray:
+    """Convert SDXL VAE output from [-1, 1] to uint8 RGB."""
+    if image.dim() == 4:
+        image = image[0]
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = (image * 255).round().byte()
+    return image.permute(1, 2, 0).cpu().numpy()
+
+
 def _decode_latents_to_pil(pipeline, latents: torch.Tensor, resize_to: Optional[Tuple[int, int]]) -> Image.Image:
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False,
     )[0]
-    if image.dim() == 4:
-        image = image[0]
-    image = torch.clamp(image, 0, 1)
-    image = (image * 255).round().byte()
-    image_np = image.permute(1, 2, 0).cpu().numpy()
+    image_np = _vae_output_to_uint8(image)
     pil = Image.fromarray(image_np)
     if resize_to is not None:
         rw, rh = resize_to
@@ -661,14 +666,7 @@ def main():
             )
 
             # --- tensor -> PIL.Image ---
-            # 如果 image_tensor 是 [B, C, H, W]，取第一个
-            if image_tensor.dim() == 4:
-                image_tensor = image_tensor[0]
-            # 限制在 [0,1] 并转 uint8
-            image_tensor = torch.clamp(image_tensor, 0, 1)
-            image_tensor = (image_tensor * 255).round().byte()
-            # CHW -> HWC
-            image_np = image_tensor.permute(1, 2, 0).cpu().numpy()
+            image_np = _vae_output_to_uint8(image_tensor)
             image = Image.fromarray(image_np)
 
             # resize 并保存（new_w/new_h 已在上面与中间步图对齐）
