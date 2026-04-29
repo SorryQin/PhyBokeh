@@ -86,3 +86,6 @@ CUDA_VISIBLE_DEVICES=0 python inference-5t.py \
   --step_k_start 1.0 \
   --step_k_end 0.4 \
   --mixed_precision no
+
+  ## 6
+  画质糊了很多，不仅是非主体部分，所有画面都变糊了，而且看起来很毛躁
