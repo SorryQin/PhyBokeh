@@ -122,11 +122,17 @@ def _vae_output_to_uint8(image: torch.Tensor) -> np.ndarray:
     return image.permute(1, 2, 0).cpu().numpy()
 
 
-def _decode_latents_to_pil(pipeline, latents: torch.Tensor, resize_to: Optional[Tuple[int, int]]) -> Image.Image:
+def _decode_latents_to_pil(
+    pipeline,
+    latents: torch.Tensor,
+    resize_to: Optional[Tuple[int, int]],
+    gamma: float = 1.0,
+) -> Image.Image:
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False,
     )[0]
+    image = gamma_correction(image, 1.0 / gamma)
     image_np = _vae_output_to_uint8(image)
     pil = Image.fromarray(image_np)
     if resize_to is not None:
@@ -220,7 +226,7 @@ def log_validation(
     if step_save_dir is not None:
         os.makedirs(step_save_dir, exist_ok=True)
         if save_initial_encode:
-            pil0 = _decode_latents_to_pil(pipeline, latents, resize_to)
+            pil0 = _decode_latents_to_pil(pipeline, latents, resize_to, gamma=gamma)
             _save_pil_path(
                 os.path.join(step_save_dir, f"step000_init_encode.{step_image_ext}"),
                 pil0,
@@ -249,12 +255,10 @@ def log_validation(
             cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
-        latents_full = scheduler.step(
-            noise_pred,
-            t_tensor,
-            latents,
-            return_dict=True,
-        ).prev_sample
+        # 与 train-3t.py 保持一致：显式一步反推，不走 scheduler.step(prev_sample)
+        alpha_prod_t = scheduler.alphas_cumprod[t_tensor].view(-1, 1, 1, 1).to(device=device, dtype=dtype)
+        beta_prod_t = 1 - alpha_prod_t
+        latents_full = (latents - beta_prod_t.sqrt() * noise_pred) / alpha_prod_t.sqrt()
         step_k = compute_step_update_scale(
             sub_step_index=sub_i,
             num_denoise_steps=n_steps,
@@ -265,7 +269,7 @@ def log_validation(
         latents = latents + step_k * (latents_full - latents)
 
         if step_save_dir is not None:
-            pil = _decode_latents_to_pil(pipeline, latents, resize_to)
+            pil = _decode_latents_to_pil(pipeline, latents, resize_to, gamma=gamma)
             name = f"step{sub_i + 1:03d}_t{t:04d}_pisa{float(pisa_strength):.2f}.{step_image_ext}"
             _save_pil_path(os.path.join(step_save_dir, name), pil, step_image_ext)
             print(f"saved {name}")
@@ -277,6 +281,7 @@ def log_validation(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False
     )[0]
+    image = gamma_correction(image, 1.0 / gamma)
 
     return (image, None)
 
