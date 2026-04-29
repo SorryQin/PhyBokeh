@@ -114,10 +114,10 @@ def swap_words(s: str, x: str, y: str):
 
 
 def _vae_output_to_uint8(image: torch.Tensor) -> np.ndarray:
-    """Convert SDXL VAE output from [-1, 1] to uint8 RGB."""
+    """Convert SDXL VAE output from [0, 1] to uint8 RGB (与 train-tmp.py 一致)."""
     if image.dim() == 4:
         image = image[0]
-    image = (image / 2 + 0.5).clamp(0, 1)
+    image = torch.clamp(image, 0, 1)
     image = (image * 255).round().byte()
     return image.permute(1, 2, 0).cpu().numpy()
 
@@ -126,14 +126,16 @@ def _decode_latents_to_pil(
     pipeline,
     latents: torch.Tensor,
     resize_to: Optional[Tuple[int, int]],
-    gamma: float = 1.0,
 ) -> Image.Image:
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False,
     )[0]
-    image = gamma_correction(image, 1.0 / gamma)
-    image_np = _vae_output_to_uint8(image)
+    if image.dim() == 4:
+        image = image[0]
+    image = torch.clamp(image, 0, 1)
+    image = (image * 255).round().byte()
+    image_np = image.permute(1, 2, 0).cpu().numpy()
     pil = Image.fromarray(image_np)
     if resize_to is not None:
         rw, rh = resize_to
@@ -216,21 +218,23 @@ def log_validation(
     prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
     disp_coc = disp_coc.to(device=device, dtype=dtype)
 
-    # --- 仅使用 scheduler 的 alpha 累积项（与 train 的显式更新公式对齐）---
+    # --- 确保 scheduler 所有 tensor 在 GPU 上（与 train-tmp.py 一致）---
     scheduler = pipeline.scheduler
-    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
+    scheduler.set_timesteps(1000, device=device)
+    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=dtype)
+    scheduler.betas = scheduler.betas.to(device=device, dtype=dtype)
 
     if step_save_dir is not None:
         os.makedirs(step_save_dir, exist_ok=True)
         if save_initial_encode:
-            pil0 = _decode_latents_to_pil(pipeline, latents, resize_to, gamma=gamma)
+            pil0 = _decode_latents_to_pil(pipeline, latents, resize_to)
             _save_pil_path(
                 os.path.join(step_save_dir, f"step000_init_encode.{step_image_ext}"),
                 pil0,
                 step_image_ext,
             )
 
-    # --- 迭代 denoise（每步重新计算 pisa_strength，可选保存该步后的解码图）---
+    # --- 迭代 denoise（每步重新计算 pisa_strength，使用 scheduler.step() 与 train-tmp.py 一致）---
     n_steps = len(train_T_list)
     for sub_i, t in enumerate(train_T_list):
         pisa_strength = compute_pisa_strength_denoise_step(
@@ -252,13 +256,12 @@ def log_validation(
             cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
-        # 与 train-3t.py 一致：x_full = (x - sqrt(beta_t)*eps) / sqrt(alpha_t)
-        # 这里固定用 float32 计算，避免 fp16 在高 t 下数值不稳定导致“越迭代越糙”。
-        alpha_prod_t = scheduler.alphas_cumprod[t_tensor].view(-1, 1, 1, 1)
-        beta_prod_t = 1.0 - alpha_prod_t
-        latents_f = latents.to(torch.float32)
-        noise_pred_f = noise_pred.to(torch.float32)
-        latents_full = (latents_f - beta_prod_t.sqrt() * noise_pred_f) / alpha_prod_t.sqrt()
+        latents_full = scheduler.step(
+            noise_pred,
+            t_tensor,
+            latents,
+            return_dict=True,
+        ).prev_sample
         step_k = compute_step_update_scale(
             sub_step_index=sub_i,
             num_denoise_steps=n_steps,
@@ -266,22 +269,21 @@ def log_validation(
             start_scale=step_k_start,
             end_scale=step_k_end,
         )
-        latents = (latents_f + step_k * (latents_full - latents_f)).to(dtype=dtype)
+        latents = latents + step_k * (latents_full - latents)
 
         if step_save_dir is not None:
-            pil = _decode_latents_to_pil(pipeline, latents, resize_to, gamma=gamma)
+            pil = _decode_latents_to_pil(pipeline, latents, resize_to)
             name = f"step{sub_i + 1:03d}_t{t:04d}_pisa{float(pisa_strength):.2f}.{step_image_ext}"
             _save_pil_path(os.path.join(step_save_dir, name), pil, step_image_ext)
             print(f"saved {name}")
 
 
 
-    # --- 解码输出 ---
+    # --- 解码输出（与 train-tmp.py 一致：不做 gamma 逆变换）---
     image = pipeline.vae.decode(
         latents / pipeline.vae.config.scaling_factor,
         return_dict=False
     )[0]
-    image = gamma_correction(image, 1.0 / gamma)
 
     return (image, None)
 
@@ -630,15 +632,14 @@ def main():
         for blur_strength in blur_strength_list:
             defocus_strength = batch["defocus_strength"] * blur_strength
             disparity = batch["disparity"]
-            # 与 train.py：disp_coc = cat(disparity, defocus_strength * K)；默认与旧 infer 一致：coc2 = defocus * (K_cli*upsample/10)
+            # 与 train-tmp.py 一致：coc2 = defocus * (K_cli*upsample/10)
             if args.use_dataset_k and "K" in batch and batch["K"] is not None:
                 k = batch["K"].to(device=accelerator.device, dtype=torch.float32)
                 while k.dim() < 4:
                     k = k.unsqueeze(-1)
                 coc2 = defocus_strength * k
             else:
-                # 与训练分布更一致：不再额外乘 upsample，避免分辨率变大时模糊强度被放大
-                amplify = args.K / 10.0
+                amplify = args.K * args.upsample / 10.0
                 coc2 = defocus_strength * amplify
             h, w = coc2.shape[-2:]
             new_w, new_h = int(w / args.upsample), int(h / args.upsample)
@@ -671,22 +672,18 @@ def main():
                 step_image_ext=args.step_image_ext,
             )
 
-            # --- tensor -> PIL.Image ---
-            image_np = _vae_output_to_uint8(image_tensor)
+            # --- tensor -> PIL.Image（与 train-tmp.py 一致：clamp [0,1]）---
+            if image_tensor.dim() == 4:
+                image_tensor = image_tensor[0]
+            image_tensor = torch.clamp(image_tensor, 0, 1)
+            image_tensor = (image_tensor * 255).round().byte()
+            image_np = image_tensor.permute(1, 2, 0).cpu().numpy()
             image = Image.fromarray(image_np)
 
             # resize 并保存（new_w/new_h 已在上面与中间步图对齐）
             image = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-            out_name = f"{batch['filename'][0]}_blur{blur_strength:.2f}.jpg"
-            out_path = os.path.join(output_dir, out_name)
+            out_path = f"{output_dir}/{batch['filename'][0]}_blur{blur_strength:.2f}.jpg"
             image.save(out_path, subsampling=0, quality=100)
-
-            # 额外在中间步目录落一份最终图，避免与 step 图目录分离造成“看不到最终图”的误解
-            if step_dir is not None:
-                os.makedirs(step_dir, exist_ok=True)
-                final_in_step_dir = os.path.join(step_dir, f"final_{out_name}")
-                image.save(final_in_step_dir, subsampling=0, quality=100)
-            print(f"saved final image: {out_path}")
 
 
     if durations:
