@@ -46,9 +46,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from classical_renderer.scatter import ModuleRenderScatter  # circular aperture
-# from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
 
-# 与 train_pisa_per_step.py 对齐：同一前向内每个 denoise 子步单独计算 pisa_strength
 def compute_pisa_strength_denoise_step(
     sub_step_index: int,
     num_denoise_steps: int,
@@ -232,7 +230,7 @@ def log_validation(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Inference (PISA 权重在 train_T_list 各子步上线性变化，对齐 train_pisa_per_step.py)。",
+        description="Inference PISA 权重在 train_T_list 各子步上线性变化。",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -308,7 +306,7 @@ def parse_args():
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./output/run6/checkpoint-70000",
+        default="./output0428/run1/checkpoint-20000",
         help=(
             "Directory containing pytorch_lora_weights.safetensors and vae.ckpt (same layout as train checkpoints)."
         ),
@@ -328,7 +326,7 @@ def parse_args():
     parser.add_argument(
         "--pisa_ratio_end",
         type=float,
-        default=0.0,
+        default=0.2,
         help="与 train_pisa_per_step 一致：train_T_list 最后一步的 PISA 比例。",
     )
     parser.add_argument(
