@@ -255,10 +255,13 @@ def log_validation(
             cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
-        # 与 train-3t.py 保持一致：显式一步反推，不走 scheduler.step(prev_sample)
-        alpha_prod_t = scheduler.alphas_cumprod[t_tensor].view(-1, 1, 1, 1).to(device=device, dtype=dtype)
-        beta_prod_t = 1 - alpha_prod_t
-        latents_full = (latents - beta_prod_t.sqrt() * noise_pred) / alpha_prod_t.sqrt()
+        # 使用 scheduler 的一步更新可保持更稳定的去噪轨迹
+        latents_full = scheduler.step(
+            noise_pred,
+            t_tensor,
+            latents,
+            return_dict=True,
+        ).prev_sample
         step_k = compute_step_update_scale(
             sub_step_index=sub_i,
             num_denoise_steps=n_steps,
@@ -676,8 +679,16 @@ def main():
 
             # resize 并保存（new_w/new_h 已在上面与中间步图对齐）
             image = image.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-            out_path = f"{output_dir}/{batch['filename'][0]}_blur{blur_strength:.2f}.jpg"
+            out_name = f"{batch['filename'][0]}_blur{blur_strength:.2f}.jpg"
+            out_path = os.path.join(output_dir, out_name)
             image.save(out_path, subsampling=0, quality=100)
+
+            # 额外在中间步目录落一份最终图，避免与 step 图目录分离造成“看不到最终图”的误解
+            if step_dir is not None:
+                os.makedirs(step_dir, exist_ok=True)
+                final_in_step_dir = os.path.join(step_dir, f"final_{out_name}")
+                image.save(final_in_step_dir, subsampling=0, quality=100)
+            print(f"saved final image: {out_path}")
 
 
     if durations:
