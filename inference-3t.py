@@ -216,12 +216,9 @@ def log_validation(
     prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
     disp_coc = disp_coc.to(device=device, dtype=dtype)
 
-    # --- 确保 scheduler 所有 tensor 在 GPU 上 ---
+    # --- 仅使用 scheduler 的 alpha 累积项（与 train 的显式更新公式对齐）---
     scheduler = pipeline.scheduler
-    # 2026.3.5 解决NaN爆炸的问题，注释下面两行的格式转换
-    scheduler.set_timesteps(1000, device=device) # adding
-    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=dtype)
-    scheduler.betas = scheduler.betas.to(device=device, dtype=dtype)
+    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
 
     if step_save_dir is not None:
         os.makedirs(step_save_dir, exist_ok=True)
@@ -255,13 +252,13 @@ def log_validation(
             cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
-        # 使用 scheduler 的一步更新可保持更稳定的去噪轨迹
-        latents_full = scheduler.step(
-            noise_pred,
-            t_tensor,
-            latents,
-            return_dict=True,
-        ).prev_sample
+        # 与 train-3t.py 一致：x_full = (x - sqrt(beta_t)*eps) / sqrt(alpha_t)
+        # 这里固定用 float32 计算，避免 fp16 在高 t 下数值不稳定导致“越迭代越糙”。
+        alpha_prod_t = scheduler.alphas_cumprod[t_tensor].view(-1, 1, 1, 1)
+        beta_prod_t = 1.0 - alpha_prod_t
+        latents_f = latents.to(torch.float32)
+        noise_pred_f = noise_pred.to(torch.float32)
+        latents_full = (latents_f - beta_prod_t.sqrt() * noise_pred_f) / alpha_prod_t.sqrt()
         step_k = compute_step_update_scale(
             sub_step_index=sub_i,
             num_denoise_steps=n_steps,
@@ -269,7 +266,7 @@ def log_validation(
             start_scale=step_k_start,
             end_scale=step_k_end,
         )
-        latents = latents + step_k * (latents_full - latents)
+        latents = (latents_f + step_k * (latents_full - latents_f)).to(dtype=dtype)
 
         if step_save_dir is not None:
             pil = _decode_latents_to_pil(pipeline, latents, resize_to, gamma=gamma)
@@ -640,7 +637,8 @@ def main():
                     k = k.unsqueeze(-1)
                 coc2 = defocus_strength * k
             else:
-                amplify = args.K * args.upsample / 10.0
+                # 与训练分布更一致：不再额外乘 upsample，避免分辨率变大时模糊强度被放大
+                amplify = args.K / 10.0
                 coc2 = defocus_strength * amplify
             h, w = coc2.shape[-2:]
             new_w, new_h = int(w / args.upsample), int(h / args.upsample)
