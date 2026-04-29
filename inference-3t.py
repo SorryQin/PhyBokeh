@@ -46,7 +46,9 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from classical_renderer.scatter import ModuleRenderScatter  # circular aperture
+# from classical_renderer.scatter_ex import ModuleRenderScatterEX  # adjustable aperture shape
 
+# 与 train_pisa_per_step.py 对齐：同一前向内每个 denoise 子步单独计算 pisa_strength
 def compute_pisa_strength_denoise_step(
     sub_step_index: int,
     num_denoise_steps: int,
@@ -60,6 +62,42 @@ def compute_pisa_strength_denoise_step(
         1.0,
     )
     return float(start_ratio + (end_ratio - start_ratio) * progress)
+
+
+def parse_step_update_scales(raw_scales: str):
+    if raw_scales is None:
+        return None
+    raw_scales = raw_scales.strip()
+    if raw_scales == "":
+        return None
+    try:
+        values = [float(v.strip()) for v in raw_scales.split(",") if v.strip() != ""]
+    except ValueError as exc:
+        raise ValueError("--step_update_scales must be a comma-separated float list.") from exc
+    if len(values) == 0:
+        return None
+    for v in values:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("--step_update_scales values must be in [0, 1].")
+    return values
+
+
+def compute_step_update_scale(
+    sub_step_index: int,
+    num_denoise_steps: int,
+    explicit_scales,
+    start_scale: float,
+    end_scale: float,
+) -> float:
+    if explicit_scales is not None:
+        return float(explicit_scales[sub_step_index])
+    if num_denoise_steps <= 1:
+        return float(end_scale)
+    progress = min(
+        max(sub_step_index / float(num_denoise_steps - 1), 0.0),
+        1.0,
+    )
+    return float(start_scale + (end_scale - start_scale) * progress)
 
 
 # 与 train.py 中 gamma_correction 一致，保证 VAE 输入域与训练对齐
@@ -127,6 +165,9 @@ def log_validation(
     gamma: float = 1.0,
     pisa_ratio_start: float = 1.0,
     pisa_ratio_end: float = 0.0,
+    step_update_scales=None,
+    step_k_start: float = 1.0,
+    step_k_end: float = 1.0,
     step_save_dir: Optional[str] = None,
     resize_to: Optional[Tuple[int, int]] = None,
     save_initial_encode: bool = False,
@@ -203,12 +244,20 @@ def log_validation(
             cross_attention_kwargs={"disp_coc": disp_coc, "pisa_strength": float(pisa_strength)},
         ).sample
 
-        latents = scheduler.step(
+        latents_full = scheduler.step(
             noise_pred,
             t_tensor,
             latents,
             return_dict=True,
         ).prev_sample
+        step_k = compute_step_update_scale(
+            sub_step_index=sub_i,
+            num_denoise_steps=n_steps,
+            explicit_scales=step_update_scales,
+            start_scale=step_k_start,
+            end_scale=step_k_end,
+        )
+        latents = latents + step_k * (latents_full - latents)
 
         if step_save_dir is not None:
             pil = _decode_latents_to_pil(pipeline, latents, resize_to)
@@ -230,7 +279,7 @@ def log_validation(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Inference PISA 权重在 train_T_list 各子步上线性变化。",
+        description="Inference (PISA 权重在 train_T_list 各子步上线性变化，对齐 train_pisa_per_step.py)。",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -306,7 +355,7 @@ def parse_args():
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
-        default="./output0428/run1/checkpoint-20000",
+        default="./output/run6/checkpoint-70000",
         help=(
             "Directory containing pytorch_lora_weights.safetensors and vae.ckpt (same layout as train checkpoints)."
         ),
@@ -326,8 +375,29 @@ def parse_args():
     parser.add_argument(
         "--pisa_ratio_end",
         type=float,
-        default=0.2,
+        default=0.0,
         help="与 train_pisa_per_step 一致：train_T_list 最后一步的 PISA 比例。",
+    )
+    parser.add_argument(
+        "--step_update_scales",
+        type=str,
+        default="",
+        help=(
+            "显式指定每个去噪子步的更新系数 k_i，逗号分隔（例如 1.0,0.75,0.5）。"
+            " 若为空，则使用 step_k_start->step_k_end 线性插值。"
+        ),
+    )
+    parser.add_argument(
+        "--step_k_start",
+        type=float,
+        default=1.0,
+        help="当未显式指定 step_update_scales 时，第一个子步的更新系数。",
+    )
+    parser.add_argument(
+        "--step_k_end",
+        type=float,
+        default=1.0,
+        help="当未显式指定 step_update_scales 时，最后一个子步的更新系数。",
     )
     parser.add_argument(
         "--supersampling_num",
@@ -371,6 +441,14 @@ def parse_args():
     args = parser.parse_args()
     if not (0.0 <= args.pisa_ratio_start <= 1.0 and 0.0 <= args.pisa_ratio_end <= 1.0):
         raise ValueError("--pisa_ratio_start and --pisa_ratio_end must be in [0, 1].")
+    if not (0.0 <= args.step_k_start <= 1.0 and 0.0 <= args.step_k_end <= 1.0):
+        raise ValueError("--step_k_start and --step_k_end must be in [0, 1].")
+    args.step_update_scales = parse_step_update_scales(args.step_update_scales)
+    if args.step_update_scales is not None and len(args.step_update_scales) != len(args.train_T_list):
+        raise ValueError(
+            f"--step_update_scales expects {len(args.train_T_list)} values for train_T_list={args.train_T_list}, "
+            f"but got {len(args.step_update_scales)}."
+        )
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -573,6 +651,9 @@ def main():
                 gamma=args.gamma,
                 pisa_ratio_start=args.pisa_ratio_start,
                 pisa_ratio_end=args.pisa_ratio_end,
+                step_update_scales=args.step_update_scales,
+                step_k_start=args.step_k_start,
+                step_k_end=args.step_k_end,
                 step_save_dir=step_dir,
                 resize_to=(new_w, new_h) if step_dir is not None else None,
                 save_initial_encode=args.save_initial_encode,
