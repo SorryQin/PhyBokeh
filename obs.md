@@ -1399,4 +1399,18 @@ if __name__ == "__main__":
     main()
 
 ```
+#### inference-3t-strict运行脚本
+```
+CUDA_VISIBLE_DEVICES=0 python inference-3t-strict.py \
+  --pretrained_model_name_or_path "./models/sdxl-base" \
+  --resume_from_checkpoint "./output0428/run1/checkpoint-20000" \
+  --test_data_dir "./test_data/input/*.jpg" \
+  --organization EBB \
+  --output_dir "./infer-output" \
+  --data_id "3t-strict-1-20000" \
+  --mixed_precision no \
+  --resolution 512
+
+```
+
 #### train-3t
